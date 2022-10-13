@@ -8,6 +8,10 @@
 #include <mach-o/getsect.h>
 #include <mach-o/dyld.h>
 
+#define DYLD_INTERPOSE(_replacment,_replacee) \
+__attribute__((used)) static struct{ const void* replacment; const void* replacee; } _interpose_##_replacee \
+__attribute__ ((section ("__DATA,__interpose"))) = { (const void*)(unsigned long)&_replacment, (const void*)(unsigned long)&_replacee };
+
 #  define ANSI_CODE_RESET      "\033[00m"
 #  define ANSI_CODE_BOLD       "\033[1m"
 #  define ANSI_CODE_DARK       "\033[2m"
@@ -34,64 +38,7 @@
 #  define ANSI_CODE_BG_CYAN    "\033[46m"
 #  define ANSI_CODE_BG_WHITE   "\033[47m"
 
-extern char **environ;
-
-static int run_process_sync(char *path, char **argv)
-{
-    pid_t   pid;
-
-    if ((pid = fork()) < 0)
-        return (-1);
-    if (pid == 0)
-    {
-        // close(2);
-
-        if (execve(path, argv, environ) < 0)
-            perror("execve");
-
-        _exit(1);
-    }
-    waitpid(pid, NULL, 0);
-    return (0);
-}
-
-uint64_t StaticBaseAddress(void)
-{
-    const struct segment_command_64* command = getsegbyname("__TEXT");
-    uint64_t addr = command->vmaddr;
-    return addr;
-}
-
-intptr_t ImageSlide(void)
-{
-    char path[1024];
-    uint32_t size = sizeof(path);
-    if (_NSGetExecutablePath(path, &size) != 0) return -1;
-    for (uint32_t i = 0; i < _dyld_image_count(); i++)
-    {
-        if (strcmp(_dyld_get_image_name(i), path) == 0)
-            return _dyld_get_image_vmaddr_slide(i);
-    }
-    return 0;
-}
-
-uint64_t DynamicBaseAddress(void)
-{
-    return StaticBaseAddress() + ImageSlide();
-}
-
-static void    *g_libcHandle;
-
-static void log(const char *s)
-{
-    size_t len;
-
-    len = strlen(s);
-    write(2, s, len);
-}
-
-typedef void*(*t_malloc_fn)(size_t);
-typedef void(*t_free_fn)(void *);
+static int      g_initialized = 0;
 
 typedef struct s_alloc_block
 {
@@ -109,9 +56,6 @@ typedef struct s_alloc_block
     struct s_alloc_block *next;
 } t_alloc_block;
 
-static t_malloc_fn g_ref_malloc = NULL;
-static t_free_fn g_ref_free = NULL;
-
 static t_alloc_block *g_alloc_head = NULL;
 
 static void report_leaks()
@@ -120,31 +64,22 @@ static void report_leaks()
     char    **strs;
     int i;
 
-    printf("\nReporting leaks :\n");
     if (!g_alloc_head)
+    {
         printf("No leaks !!!\n");
+        return ;
+    }
+
+    printf("\nReporting leaks :\n\n");
     for (blk = g_alloc_head; blk; blk = blk->next)
     {
         printf(ANSI_CODE_BLINK ANSI_CODE_WHITE ANSI_CODE_UNDERLINE "%zu bytes" ANSI_CODE_RESET " at " ANSI_CODE_BG_BLUE ANSI_CODE_WHITE "%p" ANSI_CODE_RESET "\n", blk->size, blk->base);
         strs = backtrace_symbols(blk->callstack, blk->nframes);
         if (strs)
         {
-            for (i = 1; i < blk->nframes; ++i)
+            for (i = 0; i < blk->nframes; ++i)
             {
-                char *argv[8];
-
-                argv[0] = "atos";
-                argv[1] = "-o";
-                argv[2] = "minishell";
-                argv[3] = "-l";
-                asprintf(&argv[4], "%p", DynamicBaseAddress());
-                asprintf(&argv[5], "%p", blk->callstack[i]);
-                argv[6] = NULL;
-
-                run_process_sync("/usr/bin/atos", argv);
-
-                free(argv[4]);
-                free(argv[5]);
+                puts(strs[i]);
             }
             printf("\n\n");
             free(strs);
@@ -152,65 +87,41 @@ static void report_leaks()
     }
 }
 
-static void handle_siginfo()
-{
-    exit(1);
-}
-
 __attribute__((constructor))
 void leakanalyzer_init()
 {
-    printf("dynamic base address (%0llx) = static base address (%0llx) + image slide (%0lx)\n", DynamicBaseAddress(), StaticBaseAddress(), ImageSlide());
-
-    if (!(g_libcHandle = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY)))
-    {
-        log("Warning: could not open libc shared library\n");
-        return ;
-    }
-
-    g_ref_malloc = dlsym(g_libcHandle, "malloc");
-    if (!g_ref_malloc)
-    {
-        log("Warning: Could not find malloc symbol\n");
-    }
-
-    g_ref_free = dlsym(g_libcHandle, "free");
-    if (!g_ref_free)
-    {
-        log("Warning: Could not find free symbol\n");
-    }
-
     atexit(report_leaks);
-    signal(SIGINFO, handle_siginfo);
+
+    g_initialized = 1;
 }
 
-void    *malloc(size_t sz)
+void    *pMalloc(size_t sz)
 {
     t_alloc_block   *blk;
     void            *base;
 
-    if (!g_ref_malloc)
-        return (NULL);
-    base = g_ref_malloc(sz);
+    base = malloc(sz);
     if (!base)
         return (NULL);
-    blk = g_ref_malloc(sizeof(*blk));
+    if (g_initialized)
+    {
+        blk = malloc(sizeof(*blk));
 
-    blk->file = NULL;
-    blk->line = -1;
-    blk->func = NULL;
-    
-    blk->base = base;
-    blk->size = sz;
+        blk->file = NULL;
+        blk->line = -1;
+        blk->func = NULL;
+        
+        blk->base = base;
+        blk->size = sz;
 
-    blk->prev = NULL;
-    blk->next = g_alloc_head;
-    if (g_alloc_head)
-        g_alloc_head->prev = blk;
-    g_alloc_head = blk;
+        blk->prev = NULL;
+        blk->next = g_alloc_head;
+        if (g_alloc_head)
+            g_alloc_head->prev = blk;
+        g_alloc_head = blk;
 
-    blk->nframes = backtrace(blk->callstack, 32);
-
+        blk->nframes = backtrace(blk->callstack, 32);
+    }
     return (base);
 }
 
@@ -226,27 +137,23 @@ static t_alloc_block *find_block(void *base)
     return (NULL);
 }
 
-void    free(void *ptr)
+void    pFree(void *ptr)
 {
     t_alloc_block *blk;
     t_alloc_block *tmp;
 
-    if (!g_ref_free || !ptr)
-        return ;
-    blk = find_block(ptr);
-    if (!blk)
+    if ((blk = find_block(ptr)) != NULL)
     {
-        // fprintf(stderr, "Warning: Block not found (double free or dangling pointer)\nPointer: %p\n", ptr);
-        return ;
+        if (blk->prev)
+            blk->prev->next = blk->next;
+        if (blk->next)
+            blk->next->prev = blk->prev;
+        if (blk == g_alloc_head)
+            g_alloc_head = blk->next;
+        free(blk);
     }
-
-    if (blk->prev)
-        blk->prev->next = blk->next;
-    if (blk->next)
-        blk->next->prev = blk->prev;
-    if (blk == g_alloc_head)
-        g_alloc_head = blk->next;
-
-    g_ref_free(ptr);
-    g_ref_free(blk);
+    free(ptr);
 }
+
+DYLD_INTERPOSE(pMalloc, malloc);
+DYLD_INTERPOSE(pFree, free);
